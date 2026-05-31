@@ -1,6 +1,8 @@
 package net.hytaledepot.templates.plugin.economy;
 
 import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -8,24 +10,18 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class EconomyDemoService {
   private final Map<String, AtomicLong> actionCounters = new ConcurrentHashMap<>();
   private final Map<String, String> lastActionBySender = new ConcurrentHashMap<>();
-  private final Map<String, String> runtimeValues = new ConcurrentHashMap<>();
-  private final Map<String, String> domainState = new ConcurrentHashMap<>();
-  private final Map<String, AtomicLong> numericState = new ConcurrentHashMap<>();
-
+  private final Map<String, AtomicLong> balances = new ConcurrentHashMap<>();
+  private final Deque<String> ledger = new ArrayDeque<>();
   private volatile Path dataDirectory;
 
   public void initialize(Path dataDirectory) {
     this.dataDirectory = dataDirectory;
-    runtimeValues.put("category", "Economy");
-    runtimeValues.put("defaultAction", "credit-demo");
-    runtimeValues.put("initialized", "true");
+    balances.computeIfAbsent("treasury", key -> new AtomicLong(500));
   }
 
   public void onHeartbeat(long tick) {
     actionCounters.computeIfAbsent("heartbeat", key -> new AtomicLong()).incrementAndGet();
-    if (tick % 120 == 0) {
-      runtimeValues.put("lastHeartbeat", String.valueOf(tick));
-    }
+
   }
 
   public void recordExternalEvent(String key) {
@@ -41,7 +37,6 @@ public final class EconomyDemoService {
 
     if ("toggle".equals(normalizedAction)) {
       boolean enabled = state.toggleDemoFlag();
-      runtimeValues.put("demoFlag", String.valueOf(enabled));
       return "[Economy] demoFlag=" + enabled + ", heartbeatTicks=" + heartbeatTicks;
     }
 
@@ -71,53 +66,52 @@ public final class EconomyDemoService {
 
   public String diagnostics() {
     String directory = dataDirectory == null ? "unset" : dataDirectory.toString();
-    return "ops="
-        + operationCount()
-        + ", trackedActions="
-        + actionCounters.size()
-        + ", domainEntries="
-        + domainState.size()
-        + ", numericEntries="
-        + numericState.size()
-        + ", dataDirectory="
-        + directory;
+    return "ops=" + operationCount()
+        + ", accounts=" + balances.size()
+        + ", ledgerEntries=" + ledger.size()
+        + ", treasury=" + balanceOf("treasury")
+        + ", dataDirectory=" + directory;
   }
 
   public void shutdown() {
-    runtimeValues.put("initialized", "false");
+    ledger.clear();
   }
 
   private String handleDomainAction(String sender, String action, long heartbeatTicks) {
     if ("sample".equals(action) || "credit-demo".equals(action)) {
-      long balance = incrementNumber("balance:" + sender.toLowerCase(), 25);
+      long balance = balanceRef(sender).addAndGet(25);
+      appendLedger("credit", sender, 25, balance);
       return "credited 25 coins, balance=" + balance;
     }
     if ("transfer-demo".equals(action)) {
-      String senderKey = "balance:" + sender.toLowerCase();
-      long senderBalance = number(senderKey);
-      if (senderBalance < 10) {
-        return "transfer blocked, balance=" + senderBalance + " (need >=10)";
+      AtomicLong senderBalance = balanceRef(sender);
+      if (senderBalance.get() < 10) {
+        return "transfer blocked, balance=" + senderBalance.get() + " (need >=10)";
       }
-      setNumber(senderKey, senderBalance - 10);
-      long treasury = incrementNumber("balance:treasury", 10);
-      return "transferred 10 to treasury, senderBalance=" + number(senderKey) + ", treasury=" + treasury;
+      long nextSender = senderBalance.addAndGet(-10);
+      long treasury = balanceRef("treasury").addAndGet(10);
+      appendLedger("transfer", sender, 10, nextSender);
+      return "transferred 10 to treasury, senderBalance=" + nextSender + ", treasury=" + treasury;
     }
     if ("balance-demo".equals(action)) {
-      return "balance=" + number("balance:" + sender.toLowerCase());
+      return "balance=" + balanceOf(sender) + ", treasury=" + balanceOf("treasury");
     }
     return null;
   }
 
-  private long incrementNumber(String key, long delta) {
-    return numericState.computeIfAbsent(key, item -> new AtomicLong()).addAndGet(delta);
+  private AtomicLong balanceRef(String account) {
+    return balances.computeIfAbsent(String.valueOf(account).toLowerCase(), key -> new AtomicLong());
   }
 
-  private long number(String key) {
-    return numericState.computeIfAbsent(key, item -> new AtomicLong()).get();
+  private long balanceOf(String account) {
+    return balanceRef(account).get();
   }
 
-  private void setNumber(String key, long value) {
-    numericState.computeIfAbsent(key, item -> new AtomicLong()).set(value);
+  private void appendLedger(String kind, String account, long amount, long resultingBalance) {
+    ledger.addLast(kind + ":" + account + ":" + amount + ":" + resultingBalance);
+    while (ledger.size() > 24) {
+      ledger.removeFirst();
+    }
   }
 
   private static String normalizeAction(String action) {
